@@ -17,9 +17,12 @@
 # sharable resources on the local machine, such as the LIO
 # kernel target.
 
-import os
-import setproctitle
 import json
+import os
+import signal
+
+import setproctitle
+
 try:
     from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 except ImportError:
@@ -39,14 +42,17 @@ default_config_path = "/etc/target/targetd.yaml"
 default_config = dict(
     block_pools=['vg-targetd'],
     fs_pools=[],
+    zfs_block_pools=[],
+    zfs_enable_copy=False,
     user="admin",
     log_level='info',
     # security: no default password
     target_name="iqn.2003-01.org.linux-iscsi.%s:targetd" %
-                socket.gethostname(),
+    socket.gethostname(),
     ssl=False,
     ssl_cert="/etc/target/targetd_cert.pem",
     ssl_key="/etc/target/targetd_key.pem",
+    portal_addresses=["0.0.0.0"]
 )
 
 config = {}
@@ -56,7 +62,6 @@ mapping = dict()
 
 
 class TargetHandler(BaseHTTPRequestHandler):
-
     def log_request(self, code='-', size='-'):
         # override base class - don't log good requests
         pass
@@ -120,9 +125,8 @@ class TargetHandler(BaseHTTPRequestHandler):
                 log.debug(traceback.format_exc())
                 raise
             except TypeError:
-                error = (
-                    TargetdError.INVALID_ARGUMENT,
-                    "invalid method arguments(s)")
+                error = (TargetdError.INVALID_ARGUMENT,
+                         "invalid method arguments(s)")
                 log.debug(traceback.format_exc())
                 raise
             except TargetdError as td:
@@ -138,8 +142,10 @@ class TargetHandler(BaseHTTPRequestHandler):
             log.debug(traceback.format_exc())
             log.debug('Error=%s, msg=%s' % (error[0], error[1]))
             rpcdata = json.dumps(
-                dict(error=dict(code=error[0], message=error[1]),
-                     id=id_num, jsonrpc="2.0"))
+                dict(
+                    error=dict(code=error[0], message=error[1]),
+                    id=id_num,
+                    jsonrpc="2.0"))
         finally:
             self.wfile.write(rpcdata.encode('utf-8'))
 
@@ -148,9 +154,8 @@ class HTTPService(HTTPServer, object):
     """
     Handle requests one at a time
 
-    Note: The liblvm library we use is not thread safe, thus we need to
-    serialize access to it.  It has locking for concurrent process usage, but
-    we will keep things simple by serializing calls to it.
+    Note: Many things we are calling into are not thread safe and/or cannot be
+    done concurrently.  We will process things one at a time.
     """
 
 
@@ -159,7 +164,8 @@ class TLSHTTPService(HTTPService):
 
     def finish_request(self, sock, addr):
         sockssl = ssl.wrap_socket(
-            sock, server_side=True,
+            sock,
+            server_side=True,
             keyfile=config["ssl_key"],
             certfile=config["ssl_cert"],
             ciphers="HIGH:-aNULL:-eNULL:-PSK",
@@ -192,8 +198,8 @@ class TLSHTTPService(HTTPService):
 
     @staticmethod
     def verify_certificates():
-        return (TLSHTTPService._verify_ssl_file(config["ssl_key"]) and
-                TLSHTTPService._verify_ssl_file(config["ssl_cert"]))
+        return (TLSHTTPService._verify_ssl_file(config["ssl_key"])
+                and TLSHTTPService._verify_ssl_file(config["ssl_cert"]))
 
 
 def load_config(config_path):
@@ -201,24 +207,33 @@ def load_config(config_path):
 
     if os.path.isfile(config_path):
         config = yaml.safe_load(open(config_path).read())
-        if config is None:
+        # If a user supplies a password as "password:whatever" we don't get
+        # a parse failure, we simply get a string with the contents.
+        # Maybe there is a better way to handle this issue where we don't
+        # have a space between key and value?
+        if config is None or type(config) is str:
             config = {}
 
     for key, value in iter(default_config.items()):
         if key not in config:
             config[key] = value
 
-    # compat: handle old single-pool config option
+    # compatibility: handle old single-pool config option
     if 'pool_name' in config:
+        log.warning("Please update config file, "
+                    "'pool_name' should be 'block_pools'")
         config['block_pools'] = [config['pool_name']]
         del config['pool_name']
 
-    # uniquify pool lists
+    # Make unique pool lists
     config['block_pools'] = set(config['block_pools'])
     config['fs_pools'] = set(config['fs_pools'])
+    config['zfs_block_pools'] = set(config['zfs_block_pools'])
 
-    if not config.get('password', None):
-        log.critical("password not set in %s" % config_path)
+    passwd = config.get('password', None)
+    if not passwd or type(passwd) is not str:
+        log.critical("password not set in %s in the form 'password: string_pw'"
+                     % config_path)
         raise AttributeError
 
     # convert log level to int
@@ -250,8 +265,20 @@ def update_mapping():
     mapping['pool_list'] = pool_list
 
 
+RUN = True
+
+
+def handler(signum, frame):
+    global RUN
+    if signum == signal.SIGINT:
+        log.info("SIGINT received, shutting down ...")
+        RUN = False
+
+
 def main():
     server = None
+
+    signal.signal(signal.SIGINT, handler)
 
     try:
         load_config(default_config_path)
@@ -278,14 +305,13 @@ def main():
         server_class = HTTPService
         note = "(TLS no)"
 
-    try:
-        server = server_class(('', 18700), TargetHandler)
-        log.info("started server %s", note)
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log.info("SIGINT received, shutting down")
-        if server is not None:
-            server.socket.close()
-        return -1
+    server = server_class(('', 18700), TargetHandler)
+    log.info("started server %s", note)
+
+    server.timeout = 0.5
+    while RUN:
+        server.handle_request()
+
+    server.socket.close()
 
     return 0
