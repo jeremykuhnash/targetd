@@ -10,4 +10,5 @@ IMAGE="jeremykuhnash/targetd:$GIT_SHA"
 IMAGE_LATEST="jeremykuhnash/targetd:latest"
 docker build -t $IMAGE -f docker/Dockerfile .
 docker push $IMAGE
+docker tag $IMAGE $IMAGE_LATEST
 docker push $IMAGE_LATEST
