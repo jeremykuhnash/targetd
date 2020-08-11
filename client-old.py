@@ -1,0 +1,147 @@
+#!/usr/bin/env python
+
+# based on code from git://github.com/openstack/nova.git
+# nova/volume/nexenta/jsonrpc.py
+#
+# Copyright 2011 Nexenta Systems, Inc.
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright 2012, Andy Grover <agrover@redhat.com>
+#
+# Test client to exercise targetd.
+#
+
+
+import json
+import time
+import socket
+import base64
+
+try:
+    from urllib.request import (Request,
+                                urlopen)
+except ImportError:
+    from urllib2 import (Request,
+                         urlopen)
+
+user = "admin"
+password = "admin"
+host = 'localhost'
+port = 18700
+path = '/targetrpc'
+id_num = 1
+ssl = False
+pool = 'pve/data'
+
+
+def jsonrequest(method, params=None):
+    print("%s %s" % ("+"*20, method))
+    global id_num
+    data = json.dumps(
+        dict(id=id_num, method=method, params=params, jsonrpc="2.0"))
+    id_num += 1
+    username_pass = '%s:%s' % (user, password)
+    auth = base64.b64encode(username_pass.encode('utf-8')).decode('utf-8')
+    headers = {'Content-Type': 'application/json',
+               'Authorization': 'Basic %s' % (auth,)}
+    #print('Sending JSON data: %s' % data)
+    if ssl:
+        scheme = 'https'
+    else:
+        scheme = 'http'
+    url = "%s://%s:%s%s" % (scheme, host, port, path)
+    try:
+        request = Request(url, data.encode('utf-8'), headers)
+        response_obj = urlopen(request)
+    except socket.error as e:
+        print("error, retrying with SSL")
+        url = "https://%s:%s%s" % (host, port, path)
+        request = Request(url, data, headers)
+        response_obj = urlopen(request)
+    response_data = response_obj.read().decode('utf-8')
+    #print('Got response: %s' % response_data)
+    response = json.loads(response_data)
+    if response.get('error') is not None:
+        if response['error']['code'] <= 0:
+            raise Exception(response['error'].get('message', ''))
+        else:
+            print("Invalid error code, should be negative!")
+    else:
+        return response.get('result')
+
+results = jsonrequest("export_list")
+for result in results:
+    print("export %s %s %s %s" % (str(result['initiator_wwn']),
+                                   str(result['pool']),
+                                   str(result['vol_name']),
+                                   str(result['lun'])))
+
+#sys.exit(1)
+
+results = jsonrequest("pool_list")
+for result in results:
+    print("pool %s %s %s" %
+        (str(result['name']), str(result['size']), str(result['free_size'])))
+
+results = jsonrequest("vol_list", dict(pool=pool))
+for result in results:
+    print("vol %s %s %s" %
+          (str(result['name']), str(result['size']), str(result['uuid'])))
+
+#sys.exit(1)
+
+try:
+    jsonrequest('vol_create', dict(pool=pool, name="test2", size=4000000))
+
+    try:
+        jsonrequest("vol_copy", dict(pool=pool, vol_orig="test2",
+                                     vol_new="test2-copy"))
+
+        try:
+            jsonrequest("export_create",
+                        dict(pool=pool, vol="test2",
+                             lun=5,
+                             initiator_wwn="iqn.2006-03.com.wtf.ohyeah:666"))
+
+            print("waiting")
+            time.sleep(5)
+            results = jsonrequest("export_list")
+            for result in results:
+                print("export %s %s %s %s %s" %
+                      (str(result['initiator_wwn']),
+                       str(result['pool']),
+                       str(result['vol_name']),
+                       str(result['lun']), str(result['vol_uuid'])))
+            time.sleep(5)
+            print("go!")
+
+        finally:
+            jsonrequest("export_destroy",
+                        dict(pool=pool, vol="test2",
+                             initiator_wwn="iqn.2006-03.com.wtf.ohyeah:666"))
+
+    finally:
+        jsonrequest("vol_destroy", dict(pool=pool, name="test2-copy"))
+
+finally:
+    jsonrequest("vol_destroy", dict(pool=pool, name="test2"))
+    print("done")

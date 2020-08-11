@@ -48,12 +48,12 @@ host = 'localhost'
 port = 18700
 path = '/targetrpc'
 id_num = 1
-use_ssl = True
+use_ssl = False
 pools = ['vg-targetd/thin_pool','zfs_targetd/block_pool']
 fs_pools = ['/mnt/btrfs','/zfs_targetd/fs_pool']
 
 
-ctx = ssl.create_default_context(cafile=testlib.cert_file)
+#ctx = ssl.create_default_context(cafile=testlib.cert_file)
 
 def jsonrequest(method, params=None):
     print("%s %s" % ("+" * 20, method))
